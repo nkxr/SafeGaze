@@ -2,11 +2,13 @@ import sys
 import os
 import cv2
 import time
-from collections import deque # ใช้เก็บประวัติเวลา blink
+import numpy as np  # Import numpy ที่หัวไฟล์ให้ถูกต้อง
+from collections import deque
 
+# Setup paths
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.config import WINDOW_NAME, FRAME_WIDTH, FRAME_HEIGHT, TIME_TO_SLEEP, TIME_TO_YAWN, TIME_TO_DISTRACT, SLEEP_RECOVERY_TIME, BLINK_FREQ_THRESHOLD
+from src.config import *
 from pipeline.camera import Camera
 from pipeline.mp_face import FaceMeshDetector
 from ui.draw_utils import draw_face_mesh
@@ -15,199 +17,279 @@ from detectors.eye import calculate_ear, get_iris_position
 from detectors.mouth import calculate_mar
 from detectors.attention import calculate_head_pose
 from detectors.smoothing import SmoothValue
+
 from logic.calibration import Calibrator
 from logic.timers import EventTimer
 from logic.scoring import ScoreManager
+from logic.liveness import ActivityDetector
 from ui.overlay import HUD
 
 def main():
+    # 1. Initialize System Components
     cam = Camera()
     detector = FaceMeshDetector()
     
-    # Init Objects
-    s_ear, s_mar = SmoothValue(0.3), SmoothValue(0.3)
-    s_yaw, s_pitch = SmoothValue(0.3), SmoothValue(0.3)
-
+    s_ear = SmoothValue(0.3)
+    s_mar = SmoothValue(0.3)
+    s_yaw = SmoothValue(0.3)
+    s_pitch = SmoothValue(0.3)
+    
     calibrator = Calibrator()
+    liveness = ActivityDetector()
+    hud = HUD(FRAME_WIDTH, FRAME_HEIGHT)
+    score_mgr = ScoreManager()
+
+    # 2. Timers
     timer_sleep = EventTimer(TIME_TO_SLEEP)
     timer_yawn = EventTimer(TIME_TO_YAWN)
     timer_distract = EventTimer(TIME_TO_DISTRACT)
-    
-    # Timer สำหรับกู้คืนสถานะหลับ (ต้องลืมตาต่อเนื่อง)
     timer_recovery = EventTimer(SLEEP_RECOVERY_TIME)
-    
-    score_mgr = ScoreManager()
-    hud = HUD(FRAME_WIDTH, FRAME_HEIGHT)
 
-    # State Variables
-    mode = "IDLE"
+    # 3. State Variables
+    mode = "IDLE"  # IDLE, CALIBRATING, RUNNING, RESTING
+    
+    blink_timestamps = deque(maxlen=20)
     is_eye_closed_prev = False
+    is_sleep_locked = False
+    show_mesh = True  # Toggle Face Mesh
     
-    # Blink Rate Variables
-    blink_timestamps = deque(maxlen=20) # เก็บเวลา blink 20 ครั้งล่าสุด
-    
-    # Sleep Lock Variables
-    is_sleep_locked = False # สถานะว่าตอนนี้โดนล็อคว่าหลับอยู่หรือไม่
-
-    # Display Options
-    show_mesh = True
+    drive_start_time = None
+    rest_start_time = None
     
     prev_frame_time = 0
+    fps = 0
+    
+    # ตัวแปรสำหรับ Debug ค่าความนิ่ง
+    current_nose_var = 100.0
 
-    print("System Ready. Keys: 'c'=Calibrate, 'm'=Toggle Mesh, 'q'=Quit")
+    print(f"SafeGaze V.2 Ready on Camera Index {CAMERA_INDEX}")
+    print("Controls: 'c'=Calibrate, 'r'=Rest, 'm'=Toggle Mesh, 'q'=Quit")
 
     while True:
+        # --- Frame Capture & FPS ---
         success, frame = cam.get_frame()
         if not success: break
         
-        # FPS Calculation
         new_frame_time = time.time()
-        fps = 1 / (new_frame_time - prev_frame_time) if prev_frame_time > 0 else 0
+        if prev_frame_time > 0:
+            fps = 1 / (new_frame_time - prev_frame_time)
         prev_frame_time = new_frame_time
 
+        # --- MODE: RESTING (พักรถ) ---
+        if mode == "RESTING":
+            if rest_start_time is None: rest_start_time = time.time()
+            elapsed_rest = time.time() - rest_start_time
+            
+            hud.draw_rest_screen(frame, elapsed_rest)
+            cv2.imshow(WINDOW_NAME, frame)
+            
+            key = cv2.waitKey(5) & 0xFF
+            if key == ord('r'): 
+                mode = "IDLE" # กลับไปหน้าแรก (บังคับ Calibrate ใหม่)
+                drive_start_time = None
+                rest_start_time = None
+                print("Resuming... Please Calibrate.")
+            elif key == ord('q'): break
+            continue
+
+        # --- FACE PROCESSING ---
         results = detector.process(frame)
         
-        # 3. Toggle Mesh (วาดเฉพาะตอนเปิด)
         if show_mesh:
             draw_face_mesh(frame, results)
 
         if results.multi_face_landmarks:
             lm = results.multi_face_landmarks[0].landmark
             
-            # --- Calculation ---
+            # 1. Raw Calculations
             raw_ear = calculate_ear(lm, FRAME_WIDTH, FRAME_HEIGHT)
             raw_mar = calculate_mar(lm, FRAME_WIDTH, FRAME_HEIGHT)
             p, y, r = calculate_head_pose(lm, FRAME_WIDTH, FRAME_HEIGHT)
             iris_pos = get_iris_position(lm, FRAME_WIDTH, FRAME_HEIGHT)
+            
+            # 2. Update Liveness Data (Head & Iris)
+            liveness.update_nose(lm[1], FRAME_WIDTH, FRAME_HEIGHT)
+            liveness.update_iris(lm[468], FRAME_WIDTH, FRAME_HEIGHT)
 
+            # 3. Smoothing
             ear = s_ear.update(raw_ear)
             mar = s_mar.update(raw_mar)
             yaw = s_yaw.update(y)
             pitch = s_pitch.update(p)
 
+            # --- MODE SWITCHING ---
             if mode == "CALIBRATING":
                 calibrator.update(ear, mar, pitch, yaw)
                 hud.draw_calibration(frame, calibrator.get_progress())
-                if calibrator.is_finished: mode = "RUNNING"
+                
+                if calibrator.is_finished:
+                    mode = "RUNNING"
+                    drive_start_time = time.time()
+                    print("Calibration Done. Drive Safe!")
 
             elif mode == "RUNNING":
-                # ==========================
-                # 1. BLINK RATE LOGIC
-                # ==========================
+                # =========================================================
+                #  A. BLINK TRACKING
+                # =========================================================
                 is_eye_closed_now = (ear < calibrator.thresh_ear)
-                
-                # นับ Blink เมื่อเปลี่ยนจาก ลืม -> หลับ
                 if is_eye_closed_now and not is_eye_closed_prev:
                     blink_timestamps.append(time.time())
                 
-                # ลบ Blink ที่เก่าเกิน 10 วินาทีทิ้ง (คิด Rate ในรอบ 10 วิ)
-                current_time = time.time()
-                while blink_timestamps and current_time - blink_timestamps[0] > 10.0:
+                # ลบ blink ที่เก่าเกิน 10 วินาที
+                curr_time = time.time()
+                while blink_timestamps and curr_time - blink_timestamps[0] > 10.0:
                     blink_timestamps.popleft()
                 
-                # เช็คว่ากระพริบตาถี่เกินไหม?
                 blink_rate = len(blink_timestamps)
-                is_rapid_blink = blink_rate >= 8 # (เช่น 8 ครั้งใน 10 วิ ถือว่าเริ่มถี่ผิดปกติ)
+                is_rapid_blink = blink_rate >= BLINK_FREQ_THRESHOLD
+                is_eye_closed_prev = is_eye_closed_now
 
-                # ==========================
-                # 2. SLEEP LOCK LOGIC
-                # ==========================
-                # เช็คเงื่อนไขหลับปกติ (กันเงยหน้า)
+                # =========================================================
+                #  B. STATIC CHECK (กันรูปถ่าย + กันหลับใน)
+                # =========================================================
+                
+                # คำนวณค่า Variance เพื่อโชว์บนหน้าจอ (Debug)
+                if len(liveness.nose_history) > 10:
+                    data = np.array(liveness.nose_history)
+                    # คำนวณความแปรปรวนของแกน X และ Y รวมกัน
+                    current_nose_var = np.var(data[:, 0]) + np.var(data[:, 1])
+
+                # ตรวจสอบความนิ่ง
+                is_static = liveness.check_static(blink_rate)
+                
+                if is_static:
+                    # 1. แจ้งเตือนให้กระพริบตา
+                    hud.draw_warning(frame, "PLEASE BLINK", "Verifying Driver...")
+                    
+                    # 2. แสดงค่า Debug (ส่งค่า current_nose_var ไปด้วย)
+                    hud.draw_debug(frame, ear, mar, pitch, yaw, fps, current_nose_var)
+                    
+                    # 3. แสดงสถานะ System Paused
+                    hud.draw_bar(frame, "System Paused", 1.0, 1.0, 0, (100,100,100))
+                    
+                    # 4. หยุดการประมวลผลส่วนที่เหลือ (ไม่คิดคะแนน)
+                    cv2.imshow(WINDOW_NAME, frame)
+                    key = cv2.waitKey(5) & 0xFF
+                    if key == ord('q'): break
+                    elif key == ord('m'): show_mesh = not show_mesh
+                    continue 
+
+                # =========================================================
+                #  C. NORMAL DROWSINESS DETECTION
+                # =========================================================
+                
+                # 1. Drive Time Check
+                drive_duration = time.time() - drive_start_time
+                is_overtime = drive_duration > MAX_DRIVE_TIME
+
+                # 2. Sleep Logic (ตาปิด)
                 is_bad_angle = (pitch - calibrator.base_pitch) < -10 or (pitch - calibrator.base_pitch) > 25
                 is_sleeping_raw = (not is_bad_angle) and is_eye_closed_now
                 
-                # Update Timer ปกติ
                 trig_sleep, prog_sleep = timer_sleep.update(is_sleeping_raw)
+                if trig_sleep: is_sleep_locked = True
                 
-                # ถ้าหลอดเต็ม -> สั่ง Lock
-                if trig_sleep:
-                    is_sleep_locked = True
-                
-                # ถ้ากำลัง Lock อยู่ -> ต้องลืมตาต่อเนื่องเพื่อปลดล็อค
                 if is_sleep_locked:
-                    # ถ้าลืมตาอยู่ -> เริ่มนับเวลา Recovery
-                    is_recovering = (not is_sleeping_raw)
-                    unlocked, recovery_prog = timer_recovery.update(is_recovering)
-                    
-                    if unlocked: # กู้คืนสำเร็จ
-                        is_sleep_locked = False
-                    
-                    # บังคับให้สถานะหลับยังคงอยู่ (เต็มหลอด) ระหว่างที่ยังกู้คืนไม่เสร็จ
+                    unlocked, _ = timer_recovery.update(not is_sleeping_raw)
+                    if unlocked: is_sleep_locked = False
                     final_is_sleeping = True
-                    display_prog_sleep = 1.0 # หลอดค้างเต็ม
+                    prog_sleep = 1.0
                 else:
-                    # สถานะปกติ
-                    timer_recovery.update(False) # รีเซ็ตตัวกู้คืน
+                    timer_recovery.update(False)
                     final_is_sleeping = is_sleeping_raw
-                    display_prog_sleep = prog_sleep
 
-                is_eye_closed_prev = is_eye_closed_now
-
-                # ==========================
-                # 3. OTHER LOGIC (Yawn & Distract)
-                # ==========================
+                # 3. Yawn Logic
                 is_yawning = mar > calibrator.thresh_mar
                 trig_yawn, prog_yawn = timer_yawn.update(is_yawning)
 
+                # 4. Distraction Logic
                 diff_yaw = abs(yaw - calibrator.base_yaw)
-                diff_pitch = abs(pitch - calibrator.base_pitch)
                 is_distracted = False
-                # เดิมอาจจะตั้งไว้ 30 -> ลองขยับเป็น 35 หรือ 40
-                # เพื่อเผื่อระยะเวลาเรา "ยิ้ม" แล้วค่ามันแกว่ง
-                if diff_yaw > 40 or diff_pitch > 25: is_distracted = True
-                elif diff_yaw > 15 and ((yaw < calibrator.base_yaw and iris_pos == 'LEFT') or (yaw > calibrator.base_yaw and iris_pos == 'RIGHT')):
-                     is_distracted = True
+                
+                if diff_yaw > 35 or abs(pitch - calibrator.base_pitch) > 25: 
+                    is_distracted = True
+                elif diff_yaw > 15:
+                    if (yaw < calibrator.base_yaw and iris_pos == 'LEFT') or \
+                       (yaw > calibrator.base_yaw and iris_pos == 'RIGHT'):
+                        is_distracted = True
 
                 trig_distract, prog_distract = timer_distract.update(is_distracted)
 
-                # ==========================
-                # 4. SCORING & UI
-                # ==========================
-                # can_heal จะเป็น True ก็ต่อเมื่อ ไม่ได้ถูก Lock สถานะหลับอยู่
-                can_heal = not is_sleep_locked
-
-                curr_score = score_mgr.update(final_is_sleeping, is_yawning, is_distracted, is_rapid_blink, can_heal)
-                lvl_text, lvl_color = score_mgr.get_level()
-
-                # Draw UI
-                hud.draw_info_panel(frame, curr_score, len(blink_timestamps), lvl_text, lvl_color)
+                # =========================================================
+                #  D. PRIORITY WARNING SYSTEM
+                # =========================================================
+                warning_msg = ""
+                warning_sub = ""
                 
-                # แสดง Alert กระพริบตาถี่ (ซ้อนตรง Yawn)
-                if is_rapid_blink:
-                     hud.draw_bar(frame, f"Rapid Blink ({blink_rate})", 1.0, 1.0, 30, 440, (0, 0, 255))
-                else:
-                     c_yawn = (0, 0, 255) if is_yawning else (0, 255, 0)
-                     hud.draw_bar(frame, "Yawn", prog_yawn, 1.0, 30, 440, c_yawn)
-
-                c_sleep = (0, 0, 255) if final_is_sleeping else (0, 255, 0)
-                hud.draw_bar(frame, "Sleep", display_prog_sleep, 1.0, 30, 400, c_sleep)
-                
-                c_dist = (0, 0, 255) if is_distracted else (0, 255, 0)
-                hud.draw_bar(frame, f"Focus ({iris_pos})", prog_distract, 1.0, 30, 480, c_dist)
-
-                # 4. Debug Info (ตามที่ขอ)
-                hud.draw_debug(frame, ear, mar, pitch, yaw, iris_pos, fps)
-
-                # Warnings
+                # Priority 1: Sleep (อันตรายสุด)
                 if is_sleep_locked:
-                    # โชว์หลอด Recovery แทนว่าเหลืออีกกี่วิถึงจะหาย
-                    rec_p = int(timer_recovery.progress * 100)
-                    hud.draw_warning(frame, f"OPEN EYES! {rec_p}%")
-                elif trig_yawn: hud.draw_warning(frame, "TAKE A BREAK")
-                elif trig_distract: hud.draw_warning(frame, "EYES ON ROAD")
-                elif is_rapid_blink: hud.draw_warning(frame, "TIRED EYES?")
+                    warning_msg = "WAKE UP!"
+                    warning_sub = "Drowsiness Detected"
+                    score_mgr.update(True, False, False, False, False)
+                
+                # Priority 2: Distraction
+                elif trig_distract:
+                    warning_msg = "EYES ON ROAD"
+                    score_mgr.update(False, False, True, False, False)
 
-            else:
-                cv2.putText(frame, "Press 'c' to Start", (200, 300), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+                # Priority 3: Yawn
+                elif trig_yawn:
+                    warning_msg = "TAKE A BREAK"
+                    warning_sub = "Yawning"
+                    score_mgr.update(False, True, False, False, False)
+                
+                # Priority 4: Overtime
+                elif is_overtime:
+                    warning_msg = "TIME TO REST"
+
+                # Update Score (Normal case)
+                if not (is_sleep_locked or trig_distract or trig_yawn):
+                     curr_score = score_mgr.update(False, False, False, is_rapid_blink, True)
+                else:
+                     curr_score = score_mgr.score
+
+                # =========================================================
+                #  E. DRAW UI
+                # =========================================================
+                lvl_text, lvl_color = score_mgr.get_level()
+                
+                # Info Panel
+                hud.draw_info_panel(frame, int(curr_score), blink_rate, drive_duration, lvl_text, lvl_color)
+                
+                # Status Bars
+                c_sleep = (0,0,255) if final_is_sleeping else (0,255,0)
+                hud.draw_bar(frame, "Sleep", prog_sleep, 1.0, 0, c_sleep)
+                
+                c_yawn = (0,0,255) if is_yawning else (0,255,0)
+                hud.draw_bar(frame, "Yawn", prog_yawn, 1.0, 1, c_yawn)
+                
+                c_dist = (0,0,255) if is_distracted else (0,255,0)
+                hud.draw_bar(frame, f"Focus ({iris_pos})", prog_distract, 1.0, 2, c_dist)
+                
+                if is_rapid_blink:
+                    hud.draw_bar(frame, "Rapid Blink!", 1.0, 1.0, 3, (0,165,255))
+
+                # Warning Overlay
+                if warning_msg:
+                    hud.draw_warning(frame, warning_msg, warning_sub)
+
+                # Debug Info (ส่งค่า current_nose_var ไปแสดงผล)
+                hud.draw_debug(frame, ear, mar, pitch, yaw, fps, current_nose_var)
+
+            else: # IDLE Screen
+                cv2.putText(frame, "Press 'c' to Calibrate", (FRAME_WIDTH//2 - 200, FRAME_HEIGHT//2), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
 
         cv2.imshow(WINDOW_NAME, frame)
         key = cv2.waitKey(5) & 0xFF
-        if key == ord('q'):
-            break
+        if key == ord('q'): break
         elif key == ord('c') and mode == "IDLE":
             mode = "CALIBRATING"
             calibrator.start()
-        elif key == ord('m'): # Toggle Mesh
+        elif key == ord('r') and mode == "RUNNING":
+            mode = "RESTING"
+            rest_start_time = time.time()
+        elif key == ord('m'):
             show_mesh = not show_mesh
 
     cam.release()
